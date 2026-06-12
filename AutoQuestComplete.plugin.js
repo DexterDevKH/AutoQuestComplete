@@ -1,7 +1,7 @@
 /**
  * @name AutoQuestComplete
- * @description Ultra-Stealth background macro for automated Discord quest progression featuring sub-tick arithmetic telemetry simulation, NT-compliant process handles, and proactive enrollment.
- * @version 1.0.0
+ * @description Ultra-Stealth background macro for automated Discord quest progression featuring sub-tick arithmetic telemetry simulation, NT-compliant process handles.
+ * @version 1.0.1
  * @author @aamiaa published by DexterDevKH
  * @authorLink https://github.com/DexterDevKH
  * @website https://github.com/DexterDevKH/AutoQuestComplete
@@ -13,8 +13,8 @@ const config = {
     info: {
         name: 'AutoQuestComplete',
         authorId: "750989197611106314",
-        website: "https://github.com/DexterDevKH/AutoQuestComplete",
-        version: "1.0.0",
+        website: "https://github.com/DexterDevKH",
+        version: "1.0.1",
         description: "The absolute highest standard of undetectable single-process quest automation with secure native reward redemption handling.",
         author: [{ name: "@aamiaa", plugin_author: "DexterDevKH" }],
         github: "https://github.com/DexterDevKH/AutoQuestComplete",
@@ -22,15 +22,15 @@ const config = {
     },
     changelog: [
         {
-            title: "Security Hardening",
+            title: "Feature Removal",
             type: "fixed",
             items: [
+                "Completely removed the background Auto-Enroll routine and setup toggles to allow users to selectively opt into desired quests natively.",
                 "Safely stripped away legacy background auto-claiming arrays to completely protect accounts from anti-cheat system detection flags."
             ]
         }
     ],
     settingsPanel: [
-        { type: "switch", id: "autoEnroll", name: "Auto-Enroll Quests", note: "Automatically accepts new quests as soon as they drop.", value: true },
         { type: "switch", id: "enableNotify", name: "Status Notifications", note: "Notifies when a macro cycle state mutates.", value: true }
     ]
 };
@@ -129,10 +129,8 @@ class AutoQuestComplete {
 
             const userStatus = quest.userStatus;
 
+            // If not manually accepted/enrolled, skip automation processing entirely
             if (!userStatus?.enrolledAt) {
-                if (this.settings.autoEnroll && !this.failedQuestsQueue.has(questId)) {
-                    await this.executeEnrollmentPatch(questId);
-                }
                 return;
             }
 
@@ -149,21 +147,6 @@ class AutoQuestComplete {
         });
 
         await Promise.allSettled(tasks);
-    }
-
-    async executeEnrollmentPatch(questId) {
-        try {
-            Logger.info(this._config.info.name, `Auto-enrolling into quest identity instance: ${questId}`);
-            const response = await this.api.post({ url: `/quests/${questId}/enroll` });
-            if (response?.ok || response?.status === 200) {
-                if (this.settings.enableNotify) UI.showToast("Successfully accepted available Quest target!", { type: "success" });
-                if (this.dispatcher) {
-                    this.dispatcher.dispatch({ type: "QUESTS_ENROLL_SUCCESS", questId });
-                }
-            }
-        } catch (err) {
-            this.applyBackoffCooling(questId, err);
-        }
     }
 
     dispatchAutomationWorker(quest) {
