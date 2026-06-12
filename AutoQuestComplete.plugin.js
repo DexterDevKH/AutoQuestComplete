@@ -12,7 +12,7 @@ const config = {
     main: 'AutoQuestComplete.plugin.js',
     info: {
         name: 'AutoQuestComplete',
-        authorId: "709210314230726776",
+        authorId: "750989197611106314",
         website: "https://github.com/DexterDevKH/AutoQuestComplete",
         version: "1.0.0",
         description: "The absolute highest standard of undetectable single-process quest automation with secure native reward redemption handling.",
