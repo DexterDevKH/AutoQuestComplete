@@ -748,7 +748,7 @@ class AutoQuestComplete {
                 onConfirm: async () => {
                     const issueTitle = encodeURIComponent(`Error while completing quest: ${questName}`);
                     const issueBody = encodeURIComponent(`**Quest Name:** ${questName}\n**Error:** ${err.message}\n**Stack Trace:**\n\`\`\`${err.stack}\`\`\``);
-                    const issueUrl = `https://github.com/xenoncolt/AutoQuestComplete/issues/new?title=${issueTitle}&body=${issueBody}`;
+                    const issueUrl = `https://github.com/DexterDevKH/AutoQuestComplete/issues/new?title=${issueTitle}&body=${issueBody}`;
                     open(issueUrl);
                 },
             });
