@@ -1,7 +1,7 @@
 /**
  * @name AutoQuestComplete
  * @description Ultra-Stealth background macro for automated Discord quest progression featuring sub-tick arithmetic telemetry simulation, NT-compliant process handles.
- * @version 1.0.1
+ * @version 1.0.2
  * @author @aamiaa published by DexterDevKH
  * @authorLink https://github.com/DexterDevKH
  * @website https://github.com/DexterDevKH/AutoQuestComplete
@@ -14,389 +14,800 @@ const config = {
         name: 'AutoQuestComplete',
         authorId: "750989197611106314",
         website: "https://github.com/DexterDevKH",
-        version: "1.0.1",
+        version: "1.0.2",
         description: "The absolute highest standard of undetectable single-process quest automation with secure native reward redemption handling.",
-        author: [{ name: "@aamiaa", plugin_author: "DexterDevKH" }],
+        author: [
+            {
+                name: "@aamiaa",
+                plugin_author: "DexterDevKH",
+                github_username: "DexterDevKH",
+            }
+        ],
         github: "https://github.com/DexterDevKH/AutoQuestComplete",
         github_raw: "https://raw.githubusercontent.com/DexterDevKH/AutoQuestComplete/main/AutoQuestComplete.plugin.js"
     },
     changelog: [
         {
-            title: "Feature Removal",
-            type: "fixed",
+            title: "v1.0.2: Multi-Quest",
+            type: "added",
             items: [
-                "Completely removed the background Auto-Enroll routine and setup toggles to allow users to selectively opt into desired quests natively.",
-                "Safely stripped away legacy background auto-claiming arrays to completely protect accounts from anti-cheat system detection flags."
+                "Added support for running and completing multiple quests simultaneously.",
+                "Simultaneous spoofing for multiple running games and concurrent video/activity heartbeats."
             ]
         }
     ],
     settingsPanel: [
-        { type: "switch", id: "enableNotify", name: "Status Notifications", note: "Notifies when a macro cycle state mutates.", value: true }
+        {
+            type: "switch",
+            id: "enableNotify",
+            name: "New Quest Notification",
+            note: "Enable/Disable notification when a new quest is available.",
+            value: true
+        },
+        {
+            type: "category",
+            id: "notifyRewardTypes",
+            name: "Notification Reward Types",
+            collapsible: true,
+            shown: false,
+            settings: [
+                {
+                    type: "switch",
+                    id: 4, // VIRTUAL_CURRENCY
+                    name: "Orbs",
+                    note: "Notify for quests that reward Discord Orbs.",
+                    value: true
+                },
+                {
+                    type: "switch",
+                    id: 1, // REWARD_CODE
+                    name: "Redeemable Code",
+                    note: "Notify for quests that reward a redeemable in-game code.",
+                    value: true
+                },
+                {
+                    type: "switch",
+                    id: 2, // IN_GAME
+                    name: "In-Game Reward",
+                    note: "Notify for quests that reward an item directly in the promoted game.",
+                    value: true
+                },
+                {
+                    type: "switch", 
+                    id: 3, // COLLECTIBLE
+                    name: "Collectible",
+                    note: "Notify for quests that reward a Discord collectible (e.g. an avatar decoration).",
+                    value: true
+                },
+                {
+                    type: "switch",
+                    id: 5, // FRACTIONAL_PREMIUM
+                    name: "Nitro Trial",
+                    note: "Notify for quests that reward a free Nitro (premium) trial.",
+                    value: true
+                }
+            ]
+        }
     ]
 };
 
-const { Webpack, UI, Logger, Data, Utils } = BdApi;
+const { Webpack, UI, Logger, Data, Utils, React } = BdApi;
 
 class AutoQuestComplete {
     constructor() {
         this._config = config;
+        this._questsStore = Webpack.Stores.QuestStore;
+        this._boundHandleQuestChange = this.handleQuestChange.bind(this);
+        this._boundNewQuestHandler = this.handleNewQuest.bind(this);
+        this._activeQuestIds = new Set();
+        this._fakeGames = new Map();
+        this._gamesHooked = false;
+        this._activeStreamQuestId = null;
+        this._unsupportedQuests = new Set();
+        this._notifiedQuests = new Set();
+        this._remindersTime = new Map();
         this.settings = {};
-        this.stores = {};
-        this.api = null;
-        this.dispatcher = null;
 
-        this.runningPipelines = new Map();
-        this.failedQuestsQueue = new Set();
-        this.rateLimitCoolingPool = new Map();
+        try {
+            let currentVersionInfo = {};
+            try {
+                currentVersionInfo = Object.assign({}, { version: this._config.info.version, hasShownChangelog: false }, Data.load(this._config.info.name, "currentVersionInfo"));
+            } catch (err) {
+                currentVersionInfo = { version: this._config.info.version, hasShownChangelog: false };
+            }
+            if (this._config.info.version != currentVersionInfo.version) currentVersionInfo.hasShownChangelog = false;
+            currentVersionInfo.version = this._config.info.version;
+            Data.save(this._config.info.name, "currentVersionInfo", currentVersionInfo);
 
-        this._questChangeBound = this.evaluateQuestStateMatrix.bind(this);
+            this.checkForUpdate();
+
+            if (!currentVersionInfo.hasShownChangelog) {
+                UI.showChangelogModal({
+                    title: "AutoQuestComplete Changelog",
+                    subtitle: this._config.info.version,
+                    changes: this._config.changelog
+                });
+                currentVersionInfo.hasShownChangelog = true;
+                Data.save(this._config.info.name, "currentVersionInfo", currentVersionInfo);
+            }
+        } catch (err) {
+            Logger.error(this._config.info.name, err);
+        }
     }
 
     start() {
-        this.loadSettings();
-        if (!this.resolveDiscordModules()) {
-            UI.showToast("Failed to compile internal runtime bindings safely.", { type: "error" });
-            return;
-        }
+        const defaultSettings = this._flattenSettings().reduce((acc, setting) => {
+            acc[setting.id] = setting.value;
+            return acc;
+        }, {});
+        this.settings = Object.assign(defaultSettings, Data.load(this._config.info.name, "settings") || {});
+        try {
+            if (this._questsStore && this._questsStore.addChangeListener) {
+                this._questsStore.addChangeListener(this._boundHandleQuestChange);
+                this._questsStore.addChangeListener(this._boundNewQuestHandler);
+            }
 
-        if (this.stores.QuestStore?.addChangeListener) {
-            this.stores.QuestStore.addChangeListener(this._questChangeBound);
+            this.handleQuestChange();
+        } catch (e) {
+            Logger.error(this._config.info.name, "Error while starting AutoQuestComplete", e);
+            UI.showToast("Error while starting AutoQuestComplete", { type: "error" });
         }
-
-        setTimeout(() => this.evaluateQuestStateMatrix(), 1000);
     }
 
     stop() {
-        if (this.stores.QuestStore?.removeChangeListener) {
-            this.stores.QuestStore.removeChangeListener(this._questChangeBound);
+        if (this._questsStore && this._questsStore.removeChangeListener) {
+            this._questsStore.removeChangeListener(this._boundHandleQuestChange);
+            this._questsStore.removeChangeListener(this._boundNewQuestHandler);
+        }
+        for (const [, timeout] of this._remindersTime.entries()) {
+            clearTimeout(timeout);
         }
 
-        this.abortAllRunningPipelines();
-        Logger.info(this._config.info.name, "Terminated background tasks cleanly.");
+        const RunningGameStore = Webpack.Stores.RunningGameStore;
+        if (this._gamesHooked && RunningGameStore) {
+            if (this._realGetRunningGames) RunningGameStore.getRunningGames = this._realGetRunningGames;
+            if (this._realGetGameForPID) RunningGameStore.getGameForPID = this._realGetGameForPID;
+            this._gamesHooked = false;
+        }
+
+        const ApplicationStreamingStore = Webpack.Stores.ApplicationStreamingStore;
+        if (this._originalStreamerFunc && ApplicationStreamingStore) {
+            ApplicationStreamingStore.getStreamerActiveStreamMetadata = this._originalStreamerFunc;
+            this._originalStreamerFunc = null;
+        }
+
+        this._fakeGames.clear();
+        this._activeQuestIds.clear();
+        this._unsupportedQuests.clear();
+        this._notifiedQuests.clear();
+        this._remindersTime.clear();
     }
 
-    loadSettings() {
-        this.settings = Data.load(this._config.info.name, "settings") || this._config.settingsPanel.reduce((acc, s) => {
-            acc[s.id] = s.value;
-            return acc;
-        }, {});
+    _flattenSettings(settings = this._config.settingsPanel) {
+        return settings.flatMap(setting =>
+            setting.type === "category" && Array.isArray(setting.settings)
+                ? this._flattenSettings(setting.settings)
+                : [setting]
+        );
     }
 
     getSettingsPanel() {
+        for (const setting of this._flattenSettings()) {
+            setting.value = this.settings[setting.id];
+        }
+
         return UI.buildSettingsPanel({
             settings: this._config.settingsPanel,
-            onChange: (_, id, value) => {
+            onChange: (category, id, value) => {
                 this.settings[id] = value;
                 Data.save(this._config.info.name, "settings", this.settings);
             }
         });
     }
 
-    resolveDiscordModules() {
-        try {
-            this.dispatcher = Webpack.getByKeys('dispatch', 'subscribe', 'register', { searchExports: true });
+    getQuestApplicationId(quest) {
+        const tasks = quest?.config?.taskConfigV2?.tasks ?? {};
+        for (const task of Object.values(tasks)) {
+            const id = task?.applications?.[0]?.id;
+            if (id) return id;
+        }
+        return quest?.config?.application?.id ?? null;
+    }
 
-            const baseApi = Webpack.getModule(m => m?.Bo?.get)?.Bo || Webpack.getModule(m => m?.get && m?.post && m?.put);
-            if (baseApi) {
-                this.api = baseApi;
-            } else {
-                const networkModule = Webpack.getModule(m => m?.getRestRequestStore);
-                if (networkModule) this.api = networkModule;
+    getQuestName(quest) {
+        return quest?.config?.messages?.questName ?? quest?.config?.messages?.gameTitle ?? "Unknown Quest";
+    }
+
+    getQuestRewards(quest) {
+        return quest?.config?.rewardsConfig?.rewards ?? [];
+    }
+
+    shouldNotifyForQuest(quest) {
+        const rewards = this.getQuestRewards(quest);
+        if (!rewards.length) return true;
+        return rewards.some(reward => this.settings[reward?.type] !== false);
+    }
+
+    getRewardText(quest) {
+        const parts = this.getQuestRewards(quest).map(reward => {
+            if (typeof reward?.orbQuantity === "number" && reward.orbQuantity > 0) {
+                return reward.premiumOrbQuantity && reward.premiumOrbQuantity !== reward.orbQuantity 
+                    ? `${reward.orbQuantity} Orbs (${reward.premiumOrbQuantity} with Nitro)` 
+                    : `${reward.orbQuantity} Orbs`;
             }
+            return reward?.messages?.name;
+        }).filter(Boolean);
 
-            this.stores.QuestStore = Webpack.Stores.QuestStore;
-            this.stores.RunningGameStore = Webpack.Stores.RunningGameStore;
-            this.stores.ApplicationStreamingStore = Webpack.Stores.ApplicationStreamingStore;
-            this.stores.ChannelStore = Webpack.Stores.ChannelStore;
-            this.stores.GuildChannelStore = Webpack.Stores.GuildChannelStore;
+        return parts.length ? parts.join(", ") : null;
+    }
 
-            return !!(this.api && this.dispatcher && this.stores.QuestStore);
-        } catch (e) {
-            Logger.error(this._config.info.name, "Critical Dependency Mapping Interrupted", e);
-            return false;
+    getQuestTaskInfo(quest) {
+        const tasks = quest?.config?.taskConfigV2?.tasks ?? {};
+        const labels = {
+            WATCH_VIDEO: "Watch a video",
+            WATCH_VIDEO_ON_MOBILE: "Watch a video (mobile)",
+            PLAY_ON_DESKTOP: "Play the game",
+            STREAM_ON_DESKTOP: "Stream the game",
+            PLAY_ACTIVITY: "Play an activity",
+            ACHIEVEMENT_IN_ACTIVITY: "Earn an achievement",
+            PLAY_ON_PLAYSTATION: "Play on PlayStation",
+            PLAY_ON_XBOX: "Play on Xbox"
+        };
+        const taskName = Object.keys(labels).find(x => tasks[x] != null);
+        if (!taskName) return null;
+        const seconds = tasks[taskName]?.target ?? 0;
+        if (!seconds) return labels[taskName];
+        const duration = seconds >= 60 ? `${Math.round(seconds / 60)} min` : `${seconds} sec`;
+        return `${labels[taskName]} (~${duration})`;
+    }
+
+    formatRelativeTime(dateStr) {
+        const ms = new Date(dateStr).getTime() - Date.now();
+        if (!Number.isFinite(ms) || ms <= 0) return null;
+        const minutes = Math.floor(ms / 60000);
+        const days = Math.floor(minutes / 1440);
+        const hours = Math.floor((minutes % 1440) / 60);
+        if (days > 0) return `${days}d ${hours}h`;
+        if (hours > 0) return `${hours}h ${minutes % 60}m`;
+        return `${minutes}m`;
+    }
+
+    getQuestIconUrl(quest) {
+        const assets = quest?.config?.assets ?? {};
+        const file = assets.gameTileLight || assets.gameTileDark || assets.logotypeLight;
+        if (!file) return null;
+        return `https://cdn.discordapp.com/${file}`;
+    }
+
+    buildQuestIcon(quest) {
+        const url = this.getQuestIconUrl(quest);
+        if (!url || !React) return undefined;
+        return () => React.createElement("img", {
+            src: url,
+            width: 36,
+            height: 36,
+            style: { borderRadius: "8px", objectFit: "cover" },
+            onError: (event) => { event.currentTarget.style.display = "none"; }
+        });
+    }
+
+    buildNotificationContent(quest) {
+        const intro = `Accept "${this.getQuestName(quest)}" to start auto-completing.`;
+        const reward = this.getRewardText(quest);
+        const task = this.getQuestTaskInfo(quest);
+        const publisher = quest?.config?.messages?.gamePublisher;
+        const expiresIn = this.formatRelativeTime(quest?.config?.expiresAt);
+
+        if (!React) {
+            return [
+                intro,
+                reward && `Reward: ${reward}`,
+                task && `Task: ${task}`,
+                publisher && `Publisher: ${publisher}`,
+                expiresIn && `Expires in ${expiresIn}`
+            ].filter(Boolean).join(" • ");
+        }
+
+        const e = React.createElement;
+        const row = (label, value) => value
+            ? e("div", { style: { opacity: 0.95 } }, e("strong", null, `${label}: `), value)
+            : null;
+
+        return e("div", { style: { display: "flex", flexDirection: "column", gap: "3px" } },
+            e("div", { style: { marginBottom: "2px" } }, intro),
+            row("Reward", reward),
+            row("Task", task),
+            row("Publisher", publisher),
+            row("Expires in", expiresIn)
+        );
+    }
+
+    handleNewQuest() {
+        if (!this._questsStore?.quests || !this.settings.enableNotify) return;
+
+        const newQuests = [...this._questsStore.quests.values()].filter(x =>
+            !x.userStatus?.enrolledAt &&
+            !x.userStatus?.completedAt &&
+            new Date(x.config.expiresAt).getTime() > Date.now()
+        );
+
+        for (const new_quest of newQuests) {
+            const key = new_quest.config.application?.id ?? this.getQuestApplicationId(new_quest) ?? new_quest.id;
+            if (!this._notifiedQuests.has(key)) {
+                if (!this.shouldNotifyForQuest(new_quest)) continue;
+                this._notifiedQuests.add(key);
+                this.showQuestNotification(new_quest);
+            }
         }
     }
 
-    async evaluateQuestStateMatrix() {
-        if (!this.stores.QuestStore?.quests) return;
-        const completeList = [...this.stores.QuestStore.quests.values()];
+    async openQuests() {
+        try {
+            const quest_link = document.querySelector('a[href="/quest-home"]');
+            if (quest_link) {
+                quest_link.click();
+                await new Promise(r => setTimeout(r, 300));
+                if (location.pathname.startsWith("/quest")) return;
+            }
 
-        const tasks = completeList.map(async (quest) => {
-            const questId = quest.id;
-
-            if (new Date(quest.config.expiresAt).getTime() <= Date.now()) return;
-            if (this.rateLimitCoolingPool.has(questId) && Date.now() < this.rateLimitCoolingPool.get(questId)) return;
-
-            const userStatus = quest.userStatus;
-
-            // If not manually accepted/enrolled, skip automation processing entirely
-            if (!userStatus?.enrolledAt) {
+            const Router = Webpack.getModule(m => m?.transitionTo && m?.replaceWith && m?.getHistory, { searchExports: true });
+            if (Router?.transitionTo) {
+                Router.transitionTo("/quest-home");
                 return;
             }
 
-            // Cleanly ignore completed quests so the user can claim them naturally via native layout UI panels
-            if (userStatus?.completedAt && !userStatus?.claimedAt) {
+            window.history.pushState({}, "", "/quest-home");
+            window.dispatchEvent(new PopStateEvent("popstate"));
+        } catch (err) {
+            Logger.error(this._config.info.name, "Failed to open quests page", err);
+        }
+    }
+
+    focusQuestContainer(quest) {
+        const quest_title_id = `quest-tile-${quest.id}`;
+        let attempts = 0;
+
+        const highlight_container = () => {
+            const quest_container = document.getElementById(quest_title_id);
+            if (!quest_container) {
+                if (attempts++ < 40) {
+                    setTimeout(highlight_container, 250);
+                } else {
+                    Logger.warn(this._config.info.name, `Gave up waiting for ${quest_title_id} to render.`);
+                }
                 return;
             }
 
-            if (userStatus?.enrolledAt && !userStatus?.completedAt) {
-                if (!this.runningPipelines.has(questId)) {
-                    this.dispatchAutomationWorker(quest);
-                }
-            }
-        });
+            quest_container.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+            quest_container.setAttribute("tabindex", "-1");
+            quest_container.focus({ preventScroll: true });
 
-        await Promise.allSettled(tasks);
-    }
+            const originalOutline = quest_container.style.outline;
+            const originalOutlineOffset = quest_container.style.outlineOffset;
+            const originalBoxShadow = quest_container.style.boxShadow;
+            const originalTransition = quest_container.style.transition;
 
-    dispatchAutomationWorker(quest) {
-        const questId = quest.id;
-        const abortController = new AbortController();
-        this.runningPipelines.set(questId, abortController);
+            quest_container.style.transition = "box-shadow 180ms ease, outline 180ms ease";
+            quest_container.style.outline = "3px solid rgba(88, 101, 242, 0.95)";
+            quest_container.style.outlineOffset = "6px";
+            quest_container.style.boxShadow = "0 0 0 8px rgba(88, 101, 242, 0.2)";
 
-        this.processTaskExecution(quest, abortController.signal).catch(err => {
-            Logger.error(this._config.info.name, `Worker process crashed for ${questId}`, err);
-            this.runningPipelines.delete(questId);
-        });
-    }
-
-    async processTaskExecution(quest, signal) {
-        const taskName = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE", "ACHIEVEMENT_IN_ACTIVITY"]
-            .find(x => quest.config.taskConfigV2?.tasks?.[x] != null);
-
-        if (!taskName) return;
-
-        const targetTime = quest.config.taskConfigV2.tasks[taskName].target;
-        let currentTime = quest.userStatus?.progress?.[taskName]?.value ?? 0;
-
-        if (currentTime >= targetTime) return;
-
-        this.simulateUserInteractionFocus(quest.config.application.id);
-
-        switch (taskName) {
-            case "WATCH_VIDEO":
-            case "WATCH_VIDEO_ON_MOBILE":
-                await this.runVideoTelemetryEngine(quest, targetTime, currentTime, signal);
-                break;
-            case "PLAY_ON_DESKTOP":
-                await this.runDesktopGameSpoofer(quest, targetTime, signal);
-                break;
-            case "STREAM_ON_DESKTOP":
-                await this.runStreamTelemetryEngine(quest, targetTime, signal);
-                break;
-            case "PLAY_ACTIVITY":
-                await this.runVoiceActivityEngine(quest, targetTime, signal);
-                break;
-            default:
-                this.failedQuestsQueue.add(quest.id);
-                break;
-        }
-    }
-
-    simulateUserInteractionFocus(applicationId) {
-        try {
-            this.dispatcher.dispatch({
-                type: "TRACKING_EVENT",
-                event: "quest_interaction_initiated",
-                properties: { application_id: applicationId, client_focused: true, tick_count: Date.now() }
-            });
-        } catch { }
-    }
-
-    async runVideoTelemetryEngine(quest, target, current, signal) {
-        let localProgress = parseFloat(current);
-
-        while (localProgress < target) {
-            if (signal.aborted) return;
-
-            const frameStep = 5 + Math.floor(Math.random() * 5);
-            const elasticThrottle = (frameStep * 1000) + (Math.floor(Math.random() * 500) - 250);
-
-            await new Promise((res) => setTimeout(res, Math.max(1000, elasticThrottle)));
-
-            const dynamicJitter = Math.random() * 0.298412;
-            let computedProgress = localProgress + frameStep + dynamicJitter;
-
-            if (computedProgress >= target) {
-                computedProgress = target;
-            }
-
-            const serializedProgress = parseFloat(computedProgress.toFixed(6));
-
-            try {
-                const response = await this.api.post({
-                    url: `/quests/${quest.id}/video-progress`,
-                    body: { timestamp: serializedProgress }
-                });
-
-                if (response?.body?.completed_at) {
-                    if (this.settings.enableNotify) UI.showToast(`Quest "${quest.config.application.name}" Complete! Redeem rewards in your Gift Inventory window.`, { type: "success" });
-                    this.runningPipelines.delete(quest.id);
-                    return;
-                }
-                localProgress = serializedProgress;
-            } catch (err) {
-                if (this.applyBackoffCooling(quest.id, err)) return;
-            }
-        }
-    }
-
-    async runDesktopGameSpoofer(quest, target, signal) {
-        const appId = quest.config.application.id;
-
-        let randomPid = Math.floor(Math.random() * 15000) + 10000;
-        randomPid = randomPid - (randomPid % 4);
-
-        try {
-            const lookup = await this.api.get({ url: `/applications/public?application_ids=${appId}` });
-            const appData = lookup.body?.[0];
-            if (!appData) throw new Error("Application metadata validation error.");
-
-            const exeName = appData.executables?.find(x => x.os === "win32")?.name?.replace(">", "") || `${appData.name}.exe`;
-
-            const mockProcessHandle = {
-                cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
-                exeName,
-                exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
-                hidden: false,
-                isLauncher: false,
-                id: appId,
-                name: appData.name,
-                pid: randomPid,
-                pidPath: [randomPid],
-                processName: appData.name,
-                start: Date.now() - (Math.random() * 4000),
-            };
-
-            const originalGetGames = this.stores.RunningGameStore.getRunningGames;
-            const originalGetPid = this.stores.RunningGameStore.getGameForPID;
-
-            this.stores.RunningGameStore.getRunningGames = () => {
-                const currentList = originalGetGames.call(this.stores.RunningGameStore) || [];
-                return [...currentList, mockProcessHandle];
-            };
-
-            this.stores.RunningGameStore.getGameForPID = (p) => {
-                if (p === randomPid) return mockProcessHandle;
-                return originalGetPid.call(this.stores.RunningGameStore, p);
-            };
-
-            this.dispatcher.dispatch({
-                type: "RUNNING_GAMES_CHANGE",
-                removed: [],
-                added: [mockProcessHandle],
-                games: this.stores.RunningGameStore.getRunningGames()
-            });
-
-            const unhookInterceptor = () => {
-                this.stores.RunningGameStore.getRunningGames = originalGetGames;
-                this.stores.RunningGameStore.getGameForPID = originalGetPid;
-                this.dispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [mockProcessHandle], added: [], games: originalGetGames.call(this.stores.RunningGameStore) });
-                this.dispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", monitorHeartbeatMatrix);
-                this.runningPipelines.delete(quest.id);
-                if (this.settings.enableNotify) UI.showToast(`Quest "${quest.config.application.name}" Complete! Redeem rewards in your Gift Inventory window.`, { type: "success" });
-            };
-
-            const monitorHeartbeatMatrix = (data) => {
-                if (signal.aborted) { unhookInterceptor(); return; }
-                const freshValue = Math.floor(data?.userStatus?.progress?.PLAY_ON_DESKTOP?.value ?? 0);
-                if (freshValue >= target) unhookInterceptor();
-            };
-
-            this.dispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", monitorHeartbeatMatrix);
-        } catch (e) {
-            this.runningPipelines.delete(quest.id);
-        }
-    }
-
-    async runStreamTelemetryEngine(quest, target, signal) {
-        const originalStreamMetadata = this.stores.ApplicationStreamingStore.getStreamerActiveStreamMetadata;
-
-        let fakePid = Math.floor(Math.random() * 10000) + 20000;
-        fakePid = fakePid - (fakePid % 4);
-
-        this.stores.ApplicationStreamingStore.getStreamerActiveStreamMetadata = () => ({
-            id: quest.config.application.id,
-            pid: fakePid,
-            sourceName: null
-        });
-
-        const unhookStream = () => {
-            this.stores.ApplicationStreamingStore.getStreamerActiveStreamMetadata = originalStreamMetadata;
-            this.dispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", monitorStreamPayload);
-            this.runningPipelines.delete(quest.id);
-            if (this.settings.enableNotify) UI.showToast(`Quest "${quest.config.application.name}" Complete! Redeem rewards in your Gift Inventory window.`, { type: "success" });
+            setTimeout(() => {
+                if (!quest_container.isConnected) return;
+                quest_container.style.outline = originalOutline;
+                quest_container.style.outlineOffset = originalOutlineOffset;
+                quest_container.style.boxShadow = originalBoxShadow;
+                quest_container.style.transition = originalTransition;
+            }, 5000);
         };
 
-        const monitorStreamPayload = (data) => {
-            if (signal.aborted) { unhookStream(); return; }
-            const progressValue = Math.floor(data?.userStatus?.progress?.STREAM_ON_DESKTOP?.value ?? 0);
-            if (progressValue >= target) unhookStream();
-        };
-
-        this.dispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", monitorStreamPayload);
+        setTimeout(highlight_container, 250);
     }
 
-    async runVoiceActivityEngine(quest, target, signal) {
-        const fallBackChannelId = this.stores.ChannelStore?.getSortedPrivateChannels?.()[0]?.id ||
-            Object.values(this.stores.GuildChannelStore?.getAllGuilds?.() || {}).find(g => g && g.VOCAL?.length > 0)?.VOCAL[0]?.channel?.id;
+    showQuestNotification(quest, reminder = false) {
+        if (!quest) return;
+        const title = reminder ? `Reminder: New Quest Available!` : `New Quest Available!`;
+        const key = quest.config.application?.id ?? this.getQuestApplicationId(quest) ?? quest.id;
 
-        if (!fallBackChannelId) {
-            this.runningPipelines.delete(quest.id);
-            return;
-        }
-
-        const streamKeyPayload = `call:${fallBackChannelId}:1`;
-
-        while (true) {
-            if (signal.aborted) return;
-
-            try {
-                const packetResponse = await this.api.post({
-                    url: `/quests/${quest.id}/heartbeat`,
-                    body: { stream_key: streamKeyPayload, terminal: false }
-                });
-
-                const realTimeProgress = packetResponse.body?.progress?.PLAY_ACTIVITY?.value ?? 0;
-                if (realTimeProgress >= target) {
-                    await this.api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKeyPayload, terminal: true } });
-                    this.runningPipelines.delete(quest.id);
-                    if (this.settings.enableNotify) UI.showToast(`Quest "${quest.config.application.name}" Complete! Redeem rewards in your Gift Inventory window.`, { type: "success" });
-                    return;
+        UI.showNotification({
+            title: title,
+            content: this.buildNotificationContent(quest),
+            icon: this.buildQuestIcon(quest),
+            type: "info",
+            duration: 5 * 60 * 1000,
+            actions: [
+                {
+                    label: "Go to Quests",
+                    onClick: async () => {
+                        await this.openQuests();
+                        this.focusQuestContainer(quest);
+                    }
+                },
+                {
+                    label: "Remind Me Later",
+                    onClick: () => {
+                        const existing_reminder = this._remindersTime.get(key);
+                        if (existing_reminder) clearTimeout(existing_reminder);
+                        const reminderTimeout = setTimeout(() => {
+                            this._remindersTime.delete(key);
+                            this.showQuestNotification(quest, true);
+                        }, 60 * 60 * 1000);
+                        this._remindersTime.set(key, reminderTimeout);
+                    }
                 }
-            } catch (err) {
-                if (this.applyBackoffCooling(quest.id, err)) return;
+            ]
+        });
+    }
+
+    handleQuestChange() {
+        if (!this._questsStore?.quests) return;
+
+        const quests = [...this._questsStore.quests.values()].filter(x =>
+            !this._unsupportedQuests.has(x.id) &&
+            x.userStatus?.enrolledAt &&
+            !x.userStatus?.completedAt &&
+            new Date(x.config.expiresAt).getTime() > Date.now()
+        );
+
+        for (const quest of quests) {
+            if (!this._activeQuestIds.has(quest.id)) {
+                this._activeQuestIds.add(quest.id);
+                const questName = this.getQuestName(quest);
+                UI.showToast(`Starting quest: ${questName}`, { type: "info" });
+                this.runQuest(quest);
+            }
+        }
+    }
+
+    runQuest(quest) {
+        const questName = this.getQuestName(quest);
+        const questAppId = quest.config.application?.id ?? this.getQuestApplicationId(quest) ?? quest.id;
+
+        try {
+            delete window.$;
+
+            const ApplicationStreamingStore = Webpack.Stores.ApplicationStreamingStore;
+            const FluxDispatcher = Webpack.getByKeys('dispatch', 'subscribe', 'register', { searchExports: true });
+            const api = Webpack.getModule(m => m?.Bo?.get)?.Bo;
+            const RunningGameStore = Webpack.Stores.RunningGameStore;
+
+            if (this._remindersTime.has(questAppId)) {
+                clearTimeout(this._remindersTime.get(questAppId));
+                this._remindersTime.delete(questAppId);
             }
 
-            const elasticDelay = 20000 + Math.floor(Math.random() * 3500);
-            await new Promise(res => setTimeout(res, elasticDelay));
+            if (this._notifiedQuests.has(questAppId)) {
+                this._notifiedQuests.delete(questAppId);
+            }
+
+            const pid = Math.floor(Math.random() * 30000) + 1000;
+            const taskName = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE", "ACHIEVEMENT_IN_ACTIVITY"]
+                .find(x => quest.config?.taskConfigV2?.tasks?.[x] != null);
+
+            if (!taskName) {
+                this._activeQuestIds.delete(quest.id);
+                if (this._unsupportedQuests.has(quest.id)) return;
+                this._unsupportedQuests.add(quest.id);
+                Logger.info(this._config.info.name, `${questName} is not supported by this plugin. (Consoles/Unsupported task)`);
+                UI.showToast(`Skipping ${questName}.`, { type: "warning" });
+                return;
+            }
+
+            const secondsNeeded = quest.config.taskConfigV2.tasks[taskName].target;
+            let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+
+            if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
+                const speed = 7;
+                let isFinished = false;
+
+                (async () => {
+                    try {
+                        while (true) {
+                            const remain = Math.min(speed, secondsNeeded - secondsDone);
+                            await new Promise(resolve => setTimeout(resolve, remain * 1000));
+                            const timestamp = secondsDone + speed;
+
+                            const response = await api.post({ 
+                                url: `/quests/${quest.id}/video-progress`, 
+                                body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) } 
+                            });
+                            isFinished = response?.body?.completed_at != null;
+                            secondsDone = Math.min(secondsNeeded, timestamp);
+
+                            if (timestamp >= secondsNeeded || isFinished) {
+                                break;
+                            }
+                        }
+                        if (!isFinished) {
+                            await api.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: secondsNeeded } });
+                        }
+                        Logger.info(this._config.info.name, `Quest completed: ${questName}!`);
+                        UI.showToast(`Quest completed: ${questName}!`, { type: "success" });
+                    } catch (e) {
+                        Logger.error(this._config.info.name, `Error during video progress for ${questName}:`, e);
+                    } finally {
+                        this._activeQuestIds.delete(quest.id);
+                    }
+                })();
+
+                Logger.info(this._config.info.name, `Spoofing video for ${questName}.`);
+                UI.showToast(`Spoofing video for ${questName}. Wait ~${Math.ceil((secondsNeeded - secondsDone) / speed)} sec.`, { type: "info" });
+            }
+            else if (taskName === "PLAY_ON_DESKTOP") {
+                if (!questAppId) {
+                    Logger.error(this._config.info.name, `Could not resolve the application id for "${questName}".`);
+                    UI.showToast(`Could not resolve the application id for "${questName}".`, { type: "error" });
+                    this._activeQuestIds.delete(quest.id);
+                    return;
+                }
+
+                api.get({ url: `/applications/public?application_ids=${questAppId}` }).then(res => {
+                    const appData = res?.body?.[0];
+                    if (!appData) {
+                        this._activeQuestIds.delete(quest.id);
+                        return;
+                    }
+
+                    const exeName = appData.executables?.find(x => x.os === "win32")?.name?.replace(">", "") ?? appData.name.replace(/[\/\\:*?"<>|]/g, "");
+                    const fakeGame = {
+                        cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
+                        exeName,
+                        exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+                        hidden: false,
+                        isLauncher: false,
+                        id: questAppId,
+                        name: appData.name,
+                        pid: pid,
+                        pidPath: [pid],
+                        processName: appData.name,
+                        start: Date.now(),
+                    };
+
+                    if (!this._gamesHooked) {
+                        this._realGetRunningGames = RunningGameStore.getRunningGames;
+                        this._realGetGameForPID = RunningGameStore.getGameForPID;
+
+                        RunningGameStore.getRunningGames = () => {
+                            const real = this._realGetRunningGames ? this._realGetRunningGames.call(RunningGameStore) : [];
+                            return [...real, ...this._fakeGames.values()];
+                        };
+                        RunningGameStore.getGameForPID = (p) => {
+                            for (const game of this._fakeGames.values()) {
+                                if (game.pid === p) return game;
+                            }
+                            return this._realGetGameForPID ? this._realGetGameForPID.call(RunningGameStore, p) : null;
+                        };
+                        this._gamesHooked = true;
+                    }
+
+                    this._fakeGames.set(quest.id, fakeGame);
+
+                    const currentReal = this._realGetRunningGames ? this._realGetRunningGames.call(RunningGameStore) : [];
+                    FluxDispatcher.dispatch({ 
+                        type: "RUNNING_GAMES_CHANGE", 
+                        removed: [], 
+                        added: [fakeGame], 
+                        games: [...currentReal, ...this._fakeGames.values()] 
+                    });
+
+                    let fn = data => {
+                        if (data?.questId && data.questId !== quest.id) return;
+                        if (data?.userStatus?.questId && data.userStatus.questId !== quest.id) return;
+
+                        let progress = quest.config.configVersion === 1 
+                            ? data?.userStatus?.streamProgressSeconds 
+                            : Math.floor(data?.userStatus?.progress?.PLAY_ON_DESKTOP?.value ?? 0);
+
+                        if (progress == null || isNaN(progress)) return;
+
+                        Logger.info(this._config.info.name, `Quest progress (${questName}): ${progress}/${secondsNeeded}`);
+                        UI.showToast(`Quest progress (${questName}): ${progress}/${secondsNeeded}`, { type: "info" });
+
+                        if (progress >= secondsNeeded) {
+                            Logger.info(this._config.info.name, `Quest completed: ${questName}!`);
+                            UI.showToast(`Quest completed: ${questName}!`, { type: "success" });
+
+                            FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                            this._fakeGames.delete(quest.id);
+                            this._activeQuestIds.delete(quest.id);
+
+                            const remainingReal = this._realGetRunningGames ? this._realGetRunningGames.call(RunningGameStore) : [];
+                            FluxDispatcher.dispatch({ 
+                                type: "RUNNING_GAMES_CHANGE", 
+                                removed: [fakeGame], 
+                                added: [], 
+                                games: [...remainingReal, ...this._fakeGames.values()] 
+                            });
+
+                            if (this._fakeGames.size === 0 && this._gamesHooked) {
+                                RunningGameStore.getRunningGames = this._realGetRunningGames;
+                                RunningGameStore.getGameForPID = this._realGetGameForPID;
+                                this._gamesHooked = false;
+                            }
+                        }
+                    };
+
+                    FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                    Logger.info(this._config.info.name, `Spoofed game to ${questName}. Wait ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min.`);
+                    UI.showToast(`Spoofed game to ${questName}. Wait ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min.`, { type: "info" });
+                }).catch(err => {
+                    this._activeQuestIds.delete(quest.id);
+                    Logger.error(this._config.info.name, `Error fetching app info for ${questName}:`, err);
+                });
+            }
+            else if (taskName === "STREAM_ON_DESKTOP") {
+                (async () => {
+                    while (this._activeStreamQuestId && this._activeStreamQuestId !== quest.id) {
+                        await new Promise(r => setTimeout(r, 5000));
+                    }
+                    this._activeStreamQuestId = quest.id;
+
+                    if (!this._originalStreamerFunc) {
+                        this._originalStreamerFunc = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
+                    }
+
+                    ApplicationStreamingStore.getStreamerActiveStreamMetadata = () => ({
+                        id: questAppId,
+                        pid,
+                        sourceName: null
+                    });
+
+                    let fn = data => {
+                        if (data?.questId && data.questId !== quest.id) return;
+                        if (data?.userStatus?.questId && data.userStatus.questId !== quest.id) return;
+
+                        let progress = quest.config.configVersion === 1 
+                            ? data?.userStatus?.streamProgressSeconds 
+                            : Math.floor(data?.userStatus?.progress?.STREAM_ON_DESKTOP?.value ?? 0);
+
+                        if (progress == null || isNaN(progress)) return;
+
+                        Logger.info(this._config.info.name, `Quest progress (${questName}): ${progress}/${secondsNeeded}`);
+                        UI.showToast(`Quest progress (${questName}): ${progress}/${secondsNeeded}`, { type: "info" });
+
+                        if (progress >= secondsNeeded) {
+                            Logger.info(this._config.info.name, `Quest completed: ${questName}!`);
+                            UI.showToast(`Quest completed: ${questName}!`, { type: "success" });
+
+                            FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                            if (this._activeStreamQuestId === quest.id) {
+                                this._activeStreamQuestId = null;
+                                if (this._originalStreamerFunc) {
+                                    ApplicationStreamingStore.getStreamerActiveStreamMetadata = this._originalStreamerFunc;
+                                    this._originalStreamerFunc = null;
+                                }
+                            }
+                            this._activeQuestIds.delete(quest.id);
+                        }
+                    };
+
+                    FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                    Logger.info(this._config.info.name, `Spoofed stream to ${questName}. Stream ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min. (Need at least one VC peer)`);
+                    UI.showToast(`Spoofed stream to ${questName}. Stream ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min. (Need at least one VC peer)`, { type: "info" });
+                })();
+            }
+            else if (taskName === "PLAY_ACTIVITY") {
+                const channelId = Webpack.Stores.ChannelStore.getSortedPrivateChannels()[0]?.id ||
+                    Object.values(Webpack.Stores.GuildChannelStore.getAllGuilds()).find(x => x && x.VOCAL.length > 0)?.VOCAL?.[0]?.channel?.id;
+
+                if (!channelId) {
+                    Logger.error(this._config.info.name, `Could not find a voice channel for ${questName}.`);
+                    this._activeQuestIds.delete(quest.id);
+                    return;
+                }
+
+                const streamKey = `call:${channelId}:1`;
+                (async () => {
+                    try {
+                        Logger.info(this._config.info.name, `Completing quest ${questName}`);
+                        UI.showToast(`Completing quest ${questName}`, { type: "info" });
+                        while (true) {
+                            const res = await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: false } });
+                            const progress = res?.body?.progress?.PLAY_ACTIVITY?.value;
+                            Logger.info(this._config.info.name, `Quest progress (${questName}): ${progress}/${secondsNeeded}`);
+                            UI.showToast(`Quest progress (${questName}): ${progress}/${secondsNeeded}`, { type: "info" });
+                            await new Promise(resolve => setTimeout(resolve, 20000));
+                            if (progress >= secondsNeeded) {
+                                await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: true } });
+                                break;
+                            }
+                        }
+                        Logger.info(this._config.info.name, `Quest completed: ${questName}!`);
+                        UI.showToast(`Quest completed: ${questName}!`, { type: "success" });
+                    } catch (err) {
+                        Logger.error(this._config.info.name, `Error in activity quest ${questName}:`, err);
+                    } finally {
+                        this._activeQuestIds.delete(quest.id);
+                    }
+                })();
+            }
+            else if (taskName === "ACHIEVEMENT_IN_ACTIVITY") {
+                this._activeQuestIds.delete(quest.id);
+                if (this._unsupportedQuests.has(quest.id)) return;
+                this._unsupportedQuests.add(quest.id);
+                UI.showConfirmationModal("Unsupported Quest Task", [`The quest "${questName}" has an unsupported Quest type: ${taskName}.`, "AutoQuestComplete will not be able to complete this quest. Because it's a server-side quest.\n  **Please complete it manually**."], {
+                    confirmText: "Go to Quest",
+                    onConfirm: async () => {
+                        await new Promise(resolve => {
+                            const started = Date.now();
+                            const check = () => {
+                                if (!document.querySelector('[role="dialog"]') || Date.now() - started > 3000) return resolve();
+                                setTimeout(check, 100);
+                            };
+                            check();
+                        });
+                        await this.openQuests();
+                        this.focusQuestContainer(quest);
+                    }
+                });
+            }
+        } catch (err) {
+            this._activeQuestIds.delete(quest.id);
+            UI.showConfirmationModal("Error", ["An error occurred while trying to complete the quest. Please reach out to developer with the following information:", `Quest Name: ${questName}`, `Error: ${err.message}`, `Or click to send report to create an issue on github`], {
+                confirmText: "Report Issue",
+                onConfirm: async () => {
+                    const issueTitle = encodeURIComponent(`Error while completing quest: ${questName}`);
+                    const issueBody = encodeURIComponent(`**Quest Name:** ${questName}\n**Error:** ${err.message}\n**Stack Trace:**\n\`\`\`${err.stack}\`\`\``);
+                    const issueUrl = `https://github.com/xenoncolt/AutoQuestComplete/issues/new?title=${issueTitle}&body=${issueBody}`;
+                    open(issueUrl);
+                },
+            });
         }
     }
 
-    applyBackoffCooling(questId, errorResponse) {
-        let penaltyTime = 30000;
-
-        if (errorResponse?.status === 429) {
-            const serverRetryHeader = errorResponse?.headers?.['retry-after'];
-            penaltyTime = serverRetryHeader ? (parseFloat(serverRetryHeader) * 1000) + 5000 : 60000;
+    async checkForUpdate() {
+        try {
+            let fileContent = await (await fetch(this._config.info.github_raw, { headers: { "User-Agent": "BetterDiscord" } })).text();
+            let remoteMeta = this.parseMeta(fileContent);
+            if (Utils.semverCompare(this._config.info.version, remoteMeta.version) > 0) {
+                this.newUpdateNotify(remoteMeta, fileContent);
+            }
+        } catch (err) {
+            Logger.error(this._config.info.name, err);
         }
-
-        Logger.warn(this._config.info.name, `Quest [${questId}] triggered a network cooler. Suspending processing for ${penaltyTime}ms.`);
-        this.rateLimitCoolingPool.set(questId, Date.now() + penaltyTime);
-
-        const pipeline = this.runningPipelines.get(questId);
-        if (pipeline) {
-            pipeline.abort();
-            this.runningPipelines.delete(questId);
-        }
-        return true;
     }
 
-    abortAllRunningPipelines() {
-        for (const [questId, controller] of this.runningPipelines.entries()) {
-            controller.abort();
+    newUpdateNotify(remoteMeta, remoteFile) {
+        Logger.info(this._config.info.name, "A new update is available!");
+
+        UI.showNotification({
+            title: `${this._config.info.name} Update Available!`,
+            content: `Version ${remoteMeta.version} is now available!`,
+            type: "info",
+            duration: 1/0,
+            actions: [
+                {
+                    label: "Update Now",
+                    onClick: async () => {
+                        if (remoteFile) {
+                            await new Promise(r => require("fs").writeFile(require("path").join(BdApi.Plugins.folder, `${this._config.info.name}.plugin.js`), remoteFile, r));
+                            try {
+                                let currentVersionInfo = Data.load(this._config.info.name, "currentVersionInfo");
+                                currentVersionInfo.hasShownChangelog = false;
+                                Data.save(this._config.info.name, "currentVersionInfo", currentVersionInfo);
+                            } catch (err) {
+                                UI.showToast("An error occurred when trying to download the update!", { type: "error" });
+                                Logger.error(this._config.info.name, "An error occurred when trying to download the update!", err);
+                            }
+                        }
+                    }
+                },
+                {
+                    label: "Update Later",
+                    onClick: () => { }
+                }
+            ]
+        });
+    }
+
+    parseMeta(fileContent) {
+        const meta = {};
+        const regex = /@([a-zA-Z]+)\s+(.+)/g;
+        let match;
+        while ((match = regex.exec(fileContent)) !== null) {
+            meta[match[1]] = match[2].trim();
         }
-        this.runningPipelines.clear();
+        return meta;
     }
 }
 
