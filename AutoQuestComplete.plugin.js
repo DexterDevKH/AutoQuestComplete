@@ -28,11 +28,11 @@ const config = {
     },
     changelog: [
         {
-            title: "v1.0.2: Multi-Quest",
+            title: "Popup Configuration & Multi-Quest",
             type: "added",
             items: [
-                "Added support for running and completing multiple quests simultaneously.",
-                "Simultaneous spoofing for multiple running games and concurrent video/activity heartbeats."
+                "Added a setting toggle to disable intrusive popups for unsupported/manual quests (e.g. ACHIEVEMENT_IN_ACTIVITY).",
+                "Runs and tracks multiple active quests concurrently."
             ]
         }
     ],
@@ -43,6 +43,13 @@ const config = {
             name: "New Quest Notification",
             note: "Enable/Disable notification when a new quest is available.",
             value: true
+        },
+        {
+            type: "switch",
+            id: "showUnsupportedModal",
+            name: "Unsupported Quest Popup",
+            note: "Show a popup modal when an unsupported quest (like in-activity achievements) cannot be auto-completed. When disabled, the quest will be skipped quietly.",
+            value: false
         },
         {
             type: "category",
@@ -489,7 +496,7 @@ class AutoQuestComplete {
                 if (this._unsupportedQuests.has(quest.id)) return;
                 this._unsupportedQuests.add(quest.id);
                 Logger.info(this._config.info.name, `${questName} is not supported by this plugin. (Consoles/Unsupported task)`);
-                UI.showToast(`Skipping ${questName}.`, { type: "warning" });
+                UI.showToast(`Skipping ${questName} (Unsupported task).`, { type: "warning" });
                 return;
             }
 
@@ -725,21 +732,27 @@ class AutoQuestComplete {
                 this._activeQuestIds.delete(quest.id);
                 if (this._unsupportedQuests.has(quest.id)) return;
                 this._unsupportedQuests.add(quest.id);
-                UI.showConfirmationModal("Unsupported Quest Task", [`The quest "${questName}" has an unsupported Quest type: ${taskName}.`, "AutoQuestComplete will not be able to complete this quest. Because it's a server-side quest.\n  **Please complete it manually**."], {
-                    confirmText: "Go to Quest",
-                    onConfirm: async () => {
-                        await new Promise(resolve => {
-                            const started = Date.now();
-                            const check = () => {
-                                if (!document.querySelector('[role="dialog"]') || Date.now() - started > 3000) return resolve();
-                                setTimeout(check, 100);
-                            };
-                            check();
-                        });
-                        await this.openQuests();
-                        this.focusQuestContainer(quest);
-                    }
-                });
+                Logger.info(this._config.info.name, `Skipping ${questName}: manual achievement required (${taskName}).`);
+
+                if (this.settings.showUnsupportedModal) {
+                    UI.showConfirmationModal("Unsupported Quest Task", [`The quest "${questName}" has an unsupported Quest type: ${taskName}.`, "AutoQuestComplete will not be able to complete this quest. Because it's a server-side quest.\n  **Please complete it manually**."], {
+                        confirmText: "Go to Quest",
+                        onConfirm: async () => {
+                            await new Promise(resolve => {
+                                const started = Date.now();
+                                const check = () => {
+                                    if (!document.querySelector('[role="dialog"]') || Date.now() - started > 3000) return resolve();
+                                    setTimeout(check, 100);
+                                };
+                                check();
+                            });
+                            await this.openQuests();
+                            this.focusQuestContainer(quest);
+                        }
+                    });
+                } else {
+                    UI.showToast(`Skipped ${questName} (Requires manual completion)`, { type: "warning" });
+                }
             }
         } catch (err) {
             this._activeQuestIds.delete(quest.id);
